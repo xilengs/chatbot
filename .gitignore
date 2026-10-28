@@ -4,3 +4,4 @@ __pycache__/
 test_file/
 .gradio/
 *.py[cod]
+tempCodeRunnerFile.py
