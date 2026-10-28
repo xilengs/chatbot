@@ -1,0 +1,6 @@
+﻿.env
+.vscode/
+__pycache__/
+test_file/
+.gradio/
+*.py[cod]
