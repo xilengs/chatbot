@@ -75,6 +75,14 @@ class ChatService:
                         if chunk.content:
                             full_answer += chunk.content
                             yield full_answer
+
+                    if (
+                        response is not None
+                        and response.response_metadata.get(
+                            "finish_reason",
+                        ) == "length"
+                    ):
+                        raise RuntimeError("模型输出达到长度限制，本次回复未完整生成")
                 
                 except (Exception, GeneratorExit):
                     # 流未正常结束, 但已经收到了一部分消息

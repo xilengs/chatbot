@@ -29,3 +29,11 @@ def load_settings():
     }
 
     return db_config, model_config
+
+
+def load_context_settings():
+    return {
+        "context_window": 128000,
+        "output_reserve": 16000,
+        "safety_margin": 4000,
+    }

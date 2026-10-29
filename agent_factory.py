@@ -1,3 +1,4 @@
+from pathlib import Path
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import (
     ChatPromptTemplate,
@@ -5,6 +6,7 @@ from langchain_core.prompts import (
 )
 
 from agent_tools import get_current_weather
+from token_budget_checker import TokenBudgetChecker
 
 
 SYSTEM_PROMPT = """You are an AI Agent development tutor.
@@ -51,14 +53,38 @@ def build_chat_prompt():
     return prompt.partial(summary_text="（暂无历史摘要）")
 
 
-def build_agent(model_config):
+def build_agent(model_config, *, context_settings):
     prompt = build_chat_prompt()
-    model = ChatOpenAI(**model_config)
     tools = [get_current_weather]
     tools_by_name = {
         tool.name: tool for tool in tools
     }
+    tokenizer_path = (
+        Path(__file__).resolve().parent
+        / "model_assets"
+        / "tokenizer.json"
+    )
 
-    chain = prompt | model.bind_tools(tools)
+    checker = TokenBudgetChecker(tokenizer_path, **context_settings)
+    guard = checker.as_guard(tools=tools)
+
+    # 复制配置，避免修改调用方持有的字典。
+    effective_model_config = dict(model_config)
+
+    # 统一由 context_settings 管理输出限制。
+    effective_model_config.pop("max_tokens", None)
+    effective_model_config.pop("max_completion_tokens", None)
+
+    extra_body = dict(
+        effective_model_config.get("extra_body") or {}
+    )
+    extra_body.pop("max_completion_tokens", None)
+    extra_body["max_tokens"] = checker.output_reserve
+
+    effective_model_config["extra_body"] = extra_body
+
+    model = ChatOpenAI(**effective_model_config)
+
+    chain = prompt | guard | model.bind_tools(tools)
 
     return chain, tools_by_name
