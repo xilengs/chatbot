@@ -95,9 +95,12 @@ class ContextManager:
 
     # 按上下文规划调用摘要函数合并旧摘要与待摘要轮次，保存成功后返回新摘要及近期轮次；
     # 无待摘要轮次时保留原结果，生成或保存失败时回退到旧摘要并保留未覆盖的原文。
-    def prepare_context(self, session_id, *, keep_recent_turns=2):
+    def prepare_context(self, session_id, *, keep_recent_turns=2, context_fits=None):
         if self._summarizer is None:
             raise ValueError("请先配置 summarizer")
+        
+        if context_fits is not None and not callable(context_fits):
+            raise TypeError("context_fits 必须是可调用对象或 None")
 
         plan = self.plan_context(
             session_id,
@@ -113,6 +116,15 @@ class ContextManager:
             "history_turns": candidates + plan["recent_turns"],
             "summary_status": "unchanged",
         }
+
+        if context_fits is not None:
+            fits = context_fits(result)
+
+            if type(fits) is not bool:
+                raise TypeError("context_fits 必须返回布尔值")
+            
+            if fits:
+                return result
 
         if not candidates:
             return result

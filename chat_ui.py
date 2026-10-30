@@ -4,6 +4,7 @@ from contextlib import closing
 import gradio as gr
 
 from history_display import to_chatbot_messages
+from token_budget_checker import ContextBudgetExceeded
 
 
 def build_chat_ui(service, user_id):
@@ -94,6 +95,15 @@ def build_chat_ui(service, user_id):
                         gr.skip(),
                     )
 
+        except ContextBudgetExceeded as error:
+            logging.warning(
+                "上下文预算不足，session_id=%s：%s",
+                session_id,
+                error,
+            )
+
+            raise gr.Error(str(error)) from error
+        
         except Exception as error:
             logging.exception(
                 "聊天请求失败，session_id=%s",

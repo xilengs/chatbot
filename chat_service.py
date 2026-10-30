@@ -9,14 +9,29 @@ from langchain_core.messages import (
 
 from history_loader import load_session_history
 from message_converter import to_storage_message
+from context_adapter import context_to_prompt_values
+from token_budget_checker import ContextBudgetExceeded
 
 
 class ChatService:
-    def __init__(self, storage, chain, tools_by_name):
+    def __init__(
+        self,
+        storage,
+        chain,
+        tools_by_name,
+        *,
+        context_manager,
+        context_prompt,
+        context_checker,
+    ):
         self._storage = storage
         self._chain = chain
         self._tools_by_name = tools_by_name
         self._history_cache = {}
+
+        self._context_manager = context_manager
+        self._context_prompt = context_prompt
+        self._context_checker = context_checker
 
     def get_session_history(self, session_id, *, reload=False):
         if reload or session_id not in self._history_cache:
@@ -65,11 +80,12 @@ class ChatService:
             while True:
                 response = None
                 try:
-                    for chunk in self._chain.stream({
-                        "chat_history": history.messages,
-                        "user_message": user_message,
-                        "turn_messages": turn_messages,
-                    }):
+                    model_input = self._prepare_model_inputs(
+                        session_id,
+                        user_message=user_message,
+                        turn_messages=turn_messages,
+                    )
+                    for chunk in self._chain.stream(model_input):
                         # 工具名和参数也会分段返回，需合并整轮消息后再执行。
                         response = chunk if response is None else response + chunk
                         if chunk.content:
@@ -185,3 +201,99 @@ class ChatService:
             # 流式输出结束后写回历史
             history.add_message(user_message_obj)
             history.add_messages(turn_messages)
+    
+
+    def _prepare_model_inputs(
+        self,
+        session_id,
+        user_message,
+        turn_messages,
+    ):
+        def to_inputs(prepared):
+            return {
+                **context_to_prompt_values(prepared),
+                "user_message": user_message,
+                "turn_messages": turn_messages,
+            }
+
+        def context_fits(prepared):
+            messages = self._context_prompt.invoke(
+                to_inputs(prepared)
+            ).to_messages()
+
+            return not self._context_checker.is_over_limit(
+                messages,
+                tools=list(self._tools_by_name.values()),
+            )
+
+        # 暂时不放入旧摘要和历史原文，只检查本轮及固定开销。
+        current_only = to_inputs({
+            "summary": None,
+            "history_turns": [],
+        })
+
+        current_messages = self._context_prompt.invoke(
+            current_only
+        ).to_messages()
+
+        try:
+            self._context_checker.require_fits(
+                current_messages,
+                tools=list(self._tools_by_name.values()),
+            )
+        except ContextBudgetExceeded as error:
+            if turn_messages:
+                hint = (
+                    "本轮消息（包含工具调用和工具结果）与固定提示词"
+                    "已超出输入预算；需要缩小工具返回内容或调整预算。"
+                )
+            else:
+                hint = (
+                    "当前输入与固定提示词、工具定义已超出输入预算；"
+                    "请缩短输入，或检查提示词、工具定义及预算配置。"
+                )
+
+            raise ContextBudgetExceeded(
+                f"{hint} {error}"
+            ) from error
+
+        prepared = self._context_manager.prepare_context(
+            session_id,
+            keep_recent_turns=2,
+            context_fits=context_fits,
+        )
+
+        logging.info(
+            "上下文准备完成，session_id=%s，summary_status=%s",
+            session_id,
+            prepared["summary_status"],
+        )
+
+        model_inputs = to_inputs(prepared)
+
+        final_messages = self._context_prompt.invoke(
+            model_inputs
+        ).to_messages()
+
+        try:
+            self._context_checker.require_fits(
+                final_messages,
+                tools=list(self._tools_by_name.values()),
+            )
+        except ContextBudgetExceeded as error:
+            if prepared["summary_status"] == "fallback":
+                hint = (
+                    "摘要更新失败，保留的原文仍超出输入预算，"
+                    "本轮无法继续。"
+                )
+            else:
+                hint = (
+                    "上下文处理后仍超出输入预算，"
+                    "请缩短输入或调整历史保留策略、预算配置。"
+                )
+
+            raise ContextBudgetExceeded(
+                f"{hint} {error}"
+            ) from error
+
+        return model_inputs

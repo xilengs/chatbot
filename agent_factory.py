@@ -87,4 +87,4 @@ def build_agent(model_config, *, context_settings):
 
     chain = prompt | guard | model.bind_tools(tools)
 
-    return chain, tools_by_name
+    return chain, tools_by_name, prompt, checker
