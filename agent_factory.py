@@ -82,6 +82,7 @@ def build_agent(model_config, *, context_settings):
     extra_body["max_tokens"] = checker.output_reserve
 
     effective_model_config["extra_body"] = extra_body
+    effective_model_config["stream_usage"] = True
 
     model = ChatOpenAI(**effective_model_config)
 

@@ -11,7 +11,7 @@ TYPE_TO_ROLE = {
     "tool": "tool",
 }
 
-def to_storage_message(message, status="completed"):
+def to_storage_message(message, status="completed", *, estimated_input_tokens=None):
     if not isinstance(message, BaseMessage):
         raise TypeError("message 必须是 LangChain 消息对象")
     
@@ -34,6 +34,28 @@ def to_storage_message(message, status="completed"):
         if key in data and data[key] is not None:
             payload[key] = data[key]
     
+    if estimated_input_tokens is not None:
+        if (
+            type(estimated_input_tokens) is not int
+            or estimated_input_tokens < 0
+        ):
+            raise ValueError("estimated_input_tokens 必须是非负整数")
+        
+        usage = getattr(message, "usage_metadata", None) or {}
+        actual_input = usage.get("input_tokens")
+
+        payload["token_usage"] = {
+            "estimated_version": "request_json_v1",
+            "estimated_input_tokens": estimated_input_tokens,
+            "actual_input_tokens": actual_input,
+            "actual_output_tokens": usage.get("output_tokens"),
+            "actual_total_tokens": usage.get("total_tokens"),
+            "input_difference":(
+                actual_input - estimated_input_tokens
+                if actual_input is not None else None
+            ),
+        }
+        
     return {
         "role": TYPE_TO_ROLE[message.type],
         "payload": payload,

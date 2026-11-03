@@ -52,19 +52,49 @@ def main():
         }
     )
 
+    summary_strategy_version = "learning_v1"
+    max_summary_tokens = 2048
+    
     summarize = build_summarizer(
         summary_model,
         focus="用户的学习目标、学习偏好、已掌握知识和下一步学习任务。",
         budget_checker=summary_checker,
-        max_summary_tokens=2048,
+        max_summary_tokens=max_summary_tokens,
     )
 
     context_manager = ContextManager(
         storage,
         turn_loader=load_session_turns,
-        strategy_version="learning_v1",
+        strategy_version=summary_strategy_version,
         summarizer=summarize,
     )
+
+    execution_config = {
+        "config_version": 1,
+
+        "chat_model": {
+            "name": model_config["model"],
+            "temperature": model_config.get("temperature"),
+            "max_tokens": checker.output_reserve,
+        },
+
+        "chat_budget": {
+            **context_settings,
+            "input_limit": checker.input_limit,
+        },
+
+        "tools": sorted(tools_by_name),
+
+        "summary": {
+            "enabled": True,
+            "strategy_version": summary_strategy_version,
+            "model": summary_model.model_name,
+            "temperature": summary_model.temperature,
+            "input_limit": summary_checker.input_limit,
+            "output_reserve": summary_checker.output_reserve,
+            "max_summary_tokens": max_summary_tokens,
+        },
+    }
 
     service = ChatService(
         storage=storage,
@@ -73,6 +103,8 @@ def main():
         context_manager=context_manager,
         context_prompt=prompt,
         context_checker=checker,
+        execution_config=execution_config,
+        keep_recent_turns=2,
     )
 
     page = build_chat_ui(

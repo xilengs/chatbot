@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 
 from langchain_core.messages import (
     HumanMessage,
@@ -23,7 +24,23 @@ class ChatService:
         context_manager,
         context_prompt,
         context_checker,
+        execution_config=None,
+        keep_recent_turns=2,
     ):
+        if execution_config is not None and not isinstance(
+            execution_config, dict
+        ):
+            raise TypeError("execution_config 必须是字典或 None")
+
+        if type(keep_recent_turns) is not int or keep_recent_turns < 1:
+            raise ValueError("keep_recent_turns 必须是正整数")
+
+        self._execution_config = (
+            deepcopy(execution_config)
+            if execution_config is not None
+            else {}
+        )
+        self._keep_recent_turns = keep_recent_turns
         self._storage = storage
         self._chain = chain
         self._tools_by_name = tools_by_name
@@ -67,8 +84,14 @@ class ChatService:
         full_answer = ""
         turn_messages = []
 
+        execution_config = deepcopy(self._execution_config)
+        execution_config["keep_recent_turns"] = self._keep_recent_turns
+
         # 创建轮次，并在调用模型前保存用户输入
-        turn_id = self._storage.start_turn(session_id)
+        turn_id = self._storage.start_turn(
+            session_id,
+            execution_config=execution_config,
+        )
 
         try:
             user_message_obj = HumanMessage(content=user_message)
@@ -79,12 +102,22 @@ class ChatService:
 
             while True:
                 response = None
+                estimated_input_tokens = None
                 try:
                     model_input = self._prepare_model_inputs(
                         session_id,
                         user_message=user_message,
                         turn_messages=turn_messages,
                     )
+
+                    request_messages = self._context_prompt.invoke(model_input).to_messages()
+                    estimated_input_tokens = (
+                        self._context_checker.estimate(
+                            request_messages, 
+                            tools=list(self._tools_by_name.values()),
+                            )
+                    )
+
                     for chunk in self._chain.stream(model_input):
                         # 工具名和参数也会分段返回，需合并整轮消息后再执行。
                         response = chunk if response is None else response + chunk
@@ -108,6 +141,7 @@ class ChatService:
                             partial_data = to_storage_message(
                                 partial_message,
                                 status="partial",
+                                estimated_input_tokens=estimated_input_tokens,
                             )
 
                             # 额外保留累计的原始 chunk 数据
@@ -131,7 +165,10 @@ class ChatService:
 
                 self._storage.save_message(
                     turn_id,
-                    to_storage_message(ai_message),
+                    to_storage_message(
+                        ai_message,
+                        estimated_input_tokens=estimated_input_tokens,
+                    ),
                 )
 
                 turn_messages.append(ai_message)
@@ -259,7 +296,7 @@ class ChatService:
 
         prepared = self._context_manager.prepare_context(
             session_id,
-            keep_recent_turns=2,
+            keep_recent_turns=self._keep_recent_turns,
             context_fits=context_fits,
         )
 
@@ -297,3 +334,26 @@ class ChatService:
             ) from error
 
         return model_inputs
+    
+    @staticmethod
+    def _validate_model_response(response):
+        if response is None:
+            raise RuntimeError("模型没有返回任何消息")
+        
+        reason = response.response_metadata.get("finish_reason")
+
+        if reason not in ("stop", "tool_calls"):
+            raise RuntimeError(f"模型响应为正常完成，finish_reason={reason!r}")
+        
+        if response.invalid_tool_calls:
+            raise RuntimeError("模型返回了无法解析的工具调用")
+        
+        if reason == "tool_calls":
+            if not response.tool_calls:
+                raise RuntimeError("结束原因是工具调用，但没有有效的工具请求")
+        else:
+            if response.tool_calls:
+                raise RuntimeError("结束原因是 stop，但响应仍包含工具调用")
+            
+            if not isinstance(response.content, str) or not response.content.strip():
+                raise RuntimeError("模型正常结束，但没有返回有效的文本回答")
