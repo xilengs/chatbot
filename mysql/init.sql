@@ -1,7 +1,14 @@
-CREATE DATABASE IF NOT EXISTS chat_memory
+-- 通用建库建表脚本
+-- 数据库名不写死，使用占位符 ${MYSQL_DATABASE}，由 mysql/apply_sql.py
+-- 从 .env（或同名环境变量）读取后渲染执行：
+--     python mysql/apply_sql.py init
+--
+-- 占位符：${MYSQL_DATABASE}
+
+CREATE DATABASE IF NOT EXISTS `${MYSQL_DATABASE}`
     CHARACTER SET utf8mb4;
 
-USE chat_memory;
+USE `${MYSQL_DATABASE}`;
 SET SESSION time_zone = '+00:00';
 
 CREATE TABLE IF NOT EXISTS sessions (
