@@ -1,7 +1,10 @@
 import json
-from uuid import uuid4
+from uuid import uuid4, UUID
+from threading import Lock
 
 import mysql.connector
+from mysql.connector.pooling import MySQLConnectionPool
+from mysql.connector.errors import PoolError
 
 class ChatStorage:
     def __init__(self, db_config):
@@ -12,10 +15,31 @@ class ChatStorage:
             "connection_timeout": 5,
             "autocommit": False,
         }
+        self._pool = None
+        self._pool_connections = 0
+        self._pool_lock = Lock()
     
 
     def _connect(self):
-        return mysql.connector.connect(**self._db_config)
+        # 延迟初始化；close()/上下文管理器会归还连接并重置事务状态。
+        with self._pool_lock:
+            if self._pool is None:
+                # 不把数据库参数传给构造器，避免它立即建立全部5条连接。
+                pool = MySQLConnectionPool(
+                    pool_name=f"chat_{uuid4().hex}", pool_size=5, pool_reset_session=True,
+                )
+                pool.set_config(**self._db_config)
+                pool.add_connection()
+                self._pool = pool
+                self._pool_connections = 1
+            try:
+                return self._pool.get_connection()
+            except PoolError:
+                if self._pool_connections >= self._pool.pool_size:
+                    raise
+                self._pool.add_connection()
+                self._pool_connections += 1
+                return self._pool.get_connection()
     
 
     def create_session(self, user_id=None, title=None, metadata=None):
@@ -48,7 +72,63 @@ class ChatStorage:
         return session_id
     
 
-    def start_turn(self, session_id, execution_config=None):
+    def needs_session_title(self, session_id, turn_id):
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM sessions AS s
+                    INNER JOIN turns AS t ON t.session_id = s.session_id
+                    WHERE s.session_id = %s AND t.turn_id = %s
+                      AND t.turn_seq = 1
+                      AND (s.title IS NULL OR s.title = '' OR s.title = '新会话')
+                    """,
+                    (session_id, turn_id),
+                )
+                return cursor.fetchone() is not None
+
+
+    def update_initial_session_title(self, session_id, turn_id, title):
+        if not isinstance(title, str) or not title.strip() or len(title) > 255:
+            raise ValueError("标题必须是长度不超过255的非空字符串")
+        with self._connect() as connection:
+            try:
+                with connection.cursor() as cursor:
+                    # 再次检查占位标题，避免模型调用期间覆盖已修改的名称。
+                    cursor.execute(
+                        """
+                        UPDATE sessions AS s
+                        INNER JOIN turns AS t ON t.session_id = s.session_id
+                        SET s.title = %s
+                        WHERE s.session_id = %s AND t.turn_id = %s
+                          AND t.turn_seq = 1
+                          AND (s.title IS NULL OR s.title = '' OR s.title = '新会话')
+                        """,
+                        (title.strip(), session_id, turn_id),
+                    )
+                    changed = cursor.rowcount > 0
+                    if not changed:
+                        # 提交成功但响应丢失时，重试仍应通知界面标题已经保存。
+                        cursor.execute(
+                            """
+                            SELECT s.title FROM sessions AS s
+                            INNER JOIN turns AS t ON t.session_id = s.session_id
+                            WHERE s.session_id = %s AND t.turn_id = %s
+                              AND t.turn_seq = 1
+                            """,
+                            (session_id, turn_id),
+                        )
+                        existing = cursor.fetchone()
+                        changed = existing is not None and existing[0] == title.strip()
+                connection.commit()
+                return changed
+            except Exception:
+                connection.rollback()
+                raise
+
+
+    def start_turn(self, session_id, execution_config=None, *, turn_id=None):
         if execution_config is not None and not isinstance(execution_config, dict):
             raise TypeError("execution_config must be a dictionary or None")
         
@@ -56,9 +136,19 @@ class ChatStorage:
             execution_config,
             ensure_ascii=False,
             allow_nan=False,
+            sort_keys=True,
         ) if execution_config is not None else None
 
-        turn_id = str(uuid4())
+        if turn_id is None:
+            turn_id = str(uuid4())
+        else:
+            if not isinstance(turn_id, str):
+                raise TypeError("turn_id 必须是 UUID 字符串")
+            
+            try:
+                turn_id = str(UUID(turn_id))
+            except ValueError as error:
+                raise ValueError("turn_id 必须是有效的 UUID 字符串") from error
 
         with self._connect() as connection:
             try:
@@ -76,6 +166,43 @@ class ChatStorage:
 
                     if cursor.fetchone() is None:
                         raise ValueError(f"会话不存在：{session_id}")
+                    
+                    # 此时已经锁定所属会话，再确认本次创建请求是否已经成功。
+                    cursor.execute(
+                        """
+                        SELECT session_id, execution_config
+                        FROM turns
+                        WHERE turn_id = %s
+                        """,
+                        (turn_id,),
+                    )
+                    existing = cursor.fetchone()
+
+                    if existing is not None:
+                        existing_config_json = (
+                            json.dumps(
+                                json.loads(existing["execution_config"]),
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                sort_keys=True,
+                            )
+                            if existing["execution_config"] is not None
+                            else None
+                        )
+
+                        same_request = (
+                            existing["session_id"] == session_id
+                            and existing_config_json == execution_config_json
+                        )
+
+                        if not same_request:
+                            raise ValueError(
+                                "turn_id 已存在，但所属会话或执行配置不一致"
+                            )
+
+                        # 创建请求已经成功：不分配新序号，也不修改状态或时间。
+                        connection.commit()
+                        return turn_id
                     
                     # 计算这个会话的下一个轮次序号
                     cursor.execute(
@@ -118,7 +245,7 @@ class ChatStorage:
         return turn_id
     
 
-    def save_message(self, turn_id, message_data):
+    def save_message(self, turn_id, message_data, *, message_id=None):
         if not isinstance(message_data, dict):
             raise TypeError("message_data must be a dictionary or None")
         
@@ -135,12 +262,32 @@ class ChatStorage:
         if status not in ("completed", "partial"):
             raise ValueError("status must be either 'completed' or 'partial'")
         
+        payload_format = message_data.get("payload_format", "chat_message")
+        schema_version = message_data.get("schema_version", 1)
+
+        if payload_format != "chat_message":
+            raise ValueError("暂不支持此 payload_format")
+        
+        if type(schema_version) is not int or schema_version != 1:
+            raise ValueError("暂不支持此 schema_version")
+        
         payload_json = json.dumps(
             payload,
             ensure_ascii=False,
             allow_nan=False,
+            sort_keys=True,
         )
-        message_id = str(uuid4())
+
+        if message_id is None:
+            message_id = str(uuid4())
+        else:
+            if not isinstance(message_id, str):
+                raise TypeError("message_id 必须是 UUID 字符串")
+            
+            try:
+                message_id = str(UUID(message_id))
+            except ValueError as error:
+                raise ValueError("message_id 必须是有效的 UUID 字符串") from error
 
         with self._connect() as connection:
             try:
@@ -160,8 +307,44 @@ class ChatStorage:
                     if turn is None:
                         raise ValueError(f"轮次不存在：{turn_id}")
                     
+                    cursor.execute(
+                        """
+                        SELECT turn_id, role, payload, status,
+                            payload_format, schema_version
+                        FROM messages
+                        WHERE message_id = %s
+                        """,
+                        (message_id,),
+                    )
+                    existing = cursor.fetchone()
+                    
+                    if existing is not None:
+                        existing_payload_json = json.dumps(
+                            json.loads(existing["payload"]),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            sort_keys=True,
+                        )
+
+                        same_message = (
+                            existing["turn_id"] == turn_id
+                            and existing["role"] == role
+                            and existing_payload_json == payload_json
+                            and existing["status"] == status
+                            and existing["payload_format"] == payload_format
+                            and existing["schema_version"] == schema_version
+                        )
+
+                        if not same_message:
+                            raise ValueError(f"消息 ID {message_id} 已存在，但所属轮次或消息数据不一致")
+                        
+                        # 确认之前已经保存成功，结束本次事务并返回
+                        connection.commit()
+                        return message_id
+                    
+                    # 只有新增消息才要求轮次仍在运行
                     if turn["status"] != "running":
-                        raise ValueError(f"只能向 running 状态的轮次添加消息")
+                        raise ValueError("只能向 running 状态的轮次添加消息")
                     
                     # 为当前轮次分配下一个消息序列
                     cursor.execute(
@@ -217,7 +400,7 @@ class ChatStorage:
                 with connection.cursor(dictionary=True) as cursor:
                     cursor.execute(
                         """
-                        SELECT session_id, status
+                        SELECT session_id, status, error_message
                         FROM turns
                         WHERE turn_id = %s
                         FOR UPDATE
@@ -229,7 +412,22 @@ class ChatStorage:
                     if turn is None:
                         raise ValueError(f"轮次不存在：{turn_id}")
                     if turn["status"] != "running":
-                        raise ValueError(f"轮次已经结束，当前状态：{turn['status']}")
+                        same_result = (
+                            turn["status"] == status
+                            and turn["error_message"] == error_message
+                        )
+
+                        if not same_result:
+                            raise ValueError(
+                                "轮次结束结果冲突"
+                                f"当前状态为 {turn['status']},"
+                                f"请求状态为 {status},"
+                                "状态或错误信息不一致"
+                            )
+                        
+                        # 结束结果相同，结束事务并正常返回
+                        connection.commit()
+                        return
                     
                     cursor.execute(
                         """
@@ -258,7 +456,36 @@ class ChatStorage:
                 raise
     
 
-    def load_messages(self, session_id):
+    def load_message_page(self, session_id, *, before_seq=None, page_size=20):
+        if type(page_size) is not int or not 1 <= page_size <= 100:
+            raise ValueError("page_size 必须是1到100之间的整数")
+        if before_seq is not None and (type(before_seq) is not int or before_seq < 1):
+            raise ValueError("before_seq 必须是正整数")
+        with self._connect() as connection:
+            with connection.cursor(dictionary=True) as cursor:
+                cursor.execute(
+                    """
+                    SELECT turn_seq FROM turns
+                    WHERE session_id = %s AND status = 'completed'
+                      AND turn_seq < %s
+                    ORDER BY turn_seq DESC LIMIT %s
+                    """,
+                    (session_id, before_seq or 4294967296, page_size + 1),
+                )
+                rows = cursor.fetchall()
+        if not rows:
+            return [], None
+        page = rows[:page_size]
+        oldest = page[-1]["turn_seq"]
+        records = self.load_messages(
+            session_id, after_turn_seq=oldest - 1,
+            through_turn_seq=page[0]["turn_seq"], completed_only=True,
+        )
+        return records, oldest if len(rows) > page_size else None
+
+
+    def load_messages(self, session_id, *, after_turn_seq=0,
+                      through_turn_seq=4294967295, completed_only=False):
         with self._connect() as connection:
             with connection.cursor(dictionary=True) as cursor:
                 cursor.execute(
@@ -279,9 +506,11 @@ class ChatStorage:
                     INNER JOIN turns AS t
                         ON m.turn_id = t.turn_id
                     WHERE t.session_id = %s
+                      AND t.turn_seq > %s AND t.turn_seq <= %s
+                      AND (%s = 0 OR t.status = 'completed')
                     ORDER BY t.turn_seq ASC, m.message_seq ASC      
                     """,
-                    (session_id,),
+                    (session_id, after_turn_seq, through_turn_seq, int(completed_only)),
                 )
                 messages =cursor.fetchall()
 

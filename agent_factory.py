@@ -8,6 +8,7 @@ from langchain_core.prompts import (
 from agent_tools import get_current_weather
 from token_budget_checker import TokenBudgetChecker
 
+CHAT_PROMPT_VERSION = "learning_chat_v1"
 
 SYSTEM_PROMPT = """You are an AI Agent development tutor.
 

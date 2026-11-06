@@ -5,9 +5,14 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from message_converter import from_storage_message
 from history_validation import validate_turn_messages
 
-def load_session_turns(storage, session_id):
+def load_session_turns(storage, session_id, *, after_turn_seq=0):
     """恢复已经完成且消息结构有效的轮次，保留原始轮次序号。"""
-    records = storage.load_messages(session_id)
+    records = storage.load_messages(session_id, after_turn_seq=after_turn_seq)
+    return restore_session_turns(records)
+
+
+def restore_session_turns(records):
+    """恢复一个完整轮次范围，供模型上下文和页面分页共同使用。"""
 
     records_by_turn = {}
 

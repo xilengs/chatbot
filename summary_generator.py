@@ -93,8 +93,11 @@ def build_summarizer(model, *, focus, budget_checker, max_summary_tokens=2048):
         if response.tool_calls or response.invalid_tool_calls:
             raise ValueError("摘要输出不应包含工具调用")
 
-        if response.response_metadata.get("finish_reason") == "length":
-            raise ValueError("摘要输出被长度限制截断")
+        reason = response.response_metadata.get("finish_reason")
+        if reason != "stop":
+            raise ValueError(
+                f"模型输出未正常结束，finish_reason={reason!r}"
+            )
 
         if (
             not isinstance(response.content, str)

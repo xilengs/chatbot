@@ -23,12 +23,6 @@ class ContextManager:
             strategy_version=self._strategy_version,
         )
 
-        # turn_loader 应返回按 turn_seq 升序排列的有效完整轮次。
-        # turns = self._turn_loader(
-        #     self._storage,
-        #     session_id,
-        # )
-
         covered_seq = (
             summary["covered_through_turn_seq"]
             if summary is not None
@@ -59,7 +53,11 @@ class ContextManager:
 
         # 只考虑本次状态查询时已完成的轮次
         turns = [
-            turn for turn in self._turn_loader(self._storage, session_id)
+            turn for turn in self._turn_loader(
+                self._storage, session_id,
+                # 保留边界轮次的完整性验证，但不再恢复更早的原文。
+                after_turn_seq=max(0, covered_seq - 1),
+            )
             if turn["turn_id"] in completed_ids
         ]
 

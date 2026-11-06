@@ -4,13 +4,14 @@ from pathlib import Path
 from langchain_openai import ChatOpenAI
 
 from app_config import load_settings, load_context_settings
-from agent_factory import build_agent
+from agent_factory import build_agent, CHAT_PROMPT_VERSION
 from chat_storage import ChatStorage
 from chat_service import ChatService
-from chat_ui import build_chat_ui
+from chat_ui import build_chat_ui, CHAT_CSS
 from context_manager import ContextManager
 from history_loader import load_session_turns
 from summary_generator import build_summarizer
+from session_title_generator import build_title_generator
 from token_budget_checker import TokenBudgetChecker
 
 
@@ -72,6 +73,7 @@ def main():
     execution_config = {
         "config_version": 1,
 
+        "chat_prompt": {"version": CHAT_PROMPT_VERSION},
         "chat_model": {
             "name": model_config["model"],
             "temperature": model_config.get("temperature"),
@@ -96,6 +98,14 @@ def main():
         },
     }
 
+    title_model = ChatOpenAI(**{
+        **model_config,
+        "temperature": 0,
+        "timeout": 10,
+        "max_retries": 0,
+        "extra_body": {"max_tokens": 128},
+    })
+
     service = ChatService(
         storage=storage,
         chain=chain,
@@ -105,6 +115,7 @@ def main():
         context_checker=checker,
         execution_config=execution_config,
         keep_recent_turns=2,
+        title_generator=build_title_generator(title_model),
     )
 
     page = build_chat_ui(
@@ -112,7 +123,7 @@ def main():
         user_id="user_001",
     )
 
-    page.queue().launch(share=True)
+    page.queue().launch(share=True, css=CHAT_CSS)
 
 
 if __name__ == "__main__":

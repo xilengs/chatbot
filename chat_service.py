@@ -1,5 +1,10 @@
 import logging
 from copy import deepcopy
+from collections import OrderedDict
+from time import sleep
+from uuid import uuid4
+
+from mysql.connector import Error as MySQLError, errorcode
 
 from langchain_core.messages import (
     HumanMessage,
@@ -8,10 +13,12 @@ from langchain_core.messages import (
     message_to_dict,
 )
 
-from history_loader import load_session_history
+from history_loader import load_session_history, restore_session_turns
+from history_display import to_chatbot_messages
 from message_converter import to_storage_message
 from context_adapter import context_to_prompt_values
 from token_budget_checker import ContextBudgetExceeded
+from session_title_generator import fallback_title, normalize_title
 
 
 class ChatService:
@@ -26,6 +33,7 @@ class ChatService:
         context_checker,
         execution_config=None,
         keep_recent_turns=2,
+        title_generator=None,
     ):
         if execution_config is not None and not isinstance(
             execution_config, dict
@@ -45,10 +53,13 @@ class ChatService:
         self._chain = chain
         self._tools_by_name = tools_by_name
         self._history_cache = {}
+        self._title_generator = title_generator
+        self._title_updates = OrderedDict()
 
         self._context_manager = context_manager
         self._context_prompt = context_prompt
         self._context_checker = context_checker
+
 
     def get_session_history(self, session_id, *, reload=False):
         if reload or session_id not in self._history_cache:
@@ -60,6 +71,7 @@ class ChatService:
 
         return self._history_cache[session_id]
 
+
     def create_session(self, *, user_id, title="新会话", metadata=None):
         return self._storage.create_session(
             user_id=user_id,
@@ -67,11 +79,26 @@ class ChatService:
             metadata=metadata,
         )
 
+
+    def get_history_page(self, session_id, *, before_seq=None):
+        records, cursor = self._storage.load_message_page(
+            session_id, before_seq=before_seq,
+        )
+        turns = restore_session_turns(records)
+        messages = [message for turn in turns for message in turn["messages"]]
+        return to_chatbot_messages(messages), cursor
+
+
+    def get_title_update(self, session_id):
+        return self._title_updates.get(session_id)
+
+
     def list_sessions(self, user_id, limit=100):
         return self._storage.list_sessions(
             user_id=user_id,
             limit=limit,
         )
+
 
     def stream_response(self, session_id: str, user_message: str):
         """
@@ -80,25 +107,28 @@ class ChatService:
         流式生成回复：逐段 yield 给前端。
         全部生成完毕后再把本轮对话写入历史（避免存入残缺文本）。
         """
-        history = self.get_session_history(session_id)
+        history = self._history_cache.get(session_id)
         full_answer = ""
         turn_messages = []
+        context_cache = {}
 
         execution_config = deepcopy(self._execution_config)
         execution_config["keep_recent_turns"] = self._keep_recent_turns
 
         # 创建轮次，并在调用模型前保存用户输入
-        turn_id = self._storage.start_turn(
+        turn_id = self._start_turn_with_retry(
             session_id,
             execution_config=execution_config,
         )
 
         try:
             user_message_obj = HumanMessage(content=user_message)
-            self._storage.save_message(
+            self._save_message_with_retry(
                 turn_id, 
                 to_storage_message(user_message_obj),
             )
+
+            self._generate_session_title(session_id, turn_id, user_message)
 
             while True:
                 response = None
@@ -108,6 +138,7 @@ class ChatService:
                         session_id,
                         user_message=user_message,
                         turn_messages=turn_messages,
+                        context_cache=context_cache,
                     )
 
                     request_messages = self._context_prompt.invoke(model_input).to_messages()
@@ -124,15 +155,9 @@ class ChatService:
                         if chunk.content:
                             full_answer += chunk.content
                             yield full_answer
+                    
+                    self._validate_model_response(response)
 
-                    if (
-                        response is not None
-                        and response.response_metadata.get(
-                            "finish_reason",
-                        ) == "length"
-                    ):
-                        raise RuntimeError("模型输出达到长度限制，本次回复未完整生成")
-                
                 except (Exception, GeneratorExit):
                     # 流未正常结束, 但已经收到了一部分消息
                     if response is not None:
@@ -146,7 +171,7 @@ class ChatService:
 
                             # 额外保留累计的原始 chunk 数据
                             partial_data["payload"]["raw_langchain_chunks"] = (message_to_dict(response))
-                            self._storage.save_message(turn_id, partial_data)
+                            self._save_message_with_retry(turn_id, partial_data)
                         
                         except Exception:
                             logging.exception(
@@ -163,7 +188,7 @@ class ChatService:
                 # 本次模型输出结束：合并结果转换为消息，再保存
                 ai_message = message_chunk_to_message(response)
 
-                self._storage.save_message(
+                self._save_message_with_retry(
                     turn_id,
                     to_storage_message(
                         ai_message,
@@ -186,7 +211,7 @@ class ChatService:
                     )
 
                     # 每个工具执行结束，就保存对应结果
-                    self._storage.save_message(
+                    self._save_message_with_retry(
                         turn_id,
                         to_storage_message(tool_message),
                     )
@@ -196,7 +221,7 @@ class ChatService:
         except GeneratorExit:
             # 尝试将原始错误记录到所属轮次
             try: 
-                self._storage.finish_turn(
+                self._finish_turn_with_retry(
                     turn_id,
                     status="interrupted",
                     error_message="GeneratorExit: 生成器被关闭",
@@ -214,7 +239,7 @@ class ChatService:
         except Exception as error:
             # 尝试将原始错误记录到所属轮次
             try: 
-                self._storage.finish_turn(
+                self._finish_turn_with_retry(
                     turn_id,
                     status="failed",
                     error_message=f"{type(error).__name__}:{error}",
@@ -230,21 +255,50 @@ class ChatService:
         
         else:
             # 最终回答已保存，标记本轮正常结束
-            self._storage.finish_turn(
+            self._finish_turn_with_retry(
                 turn_id,
                 status="completed"
             )
 
             # 流式输出结束后写回历史
-            history.add_message(user_message_obj)
-            history.add_messages(turn_messages)
+            if history is not None:
+                history.add_message(user_message_obj)
+                history.add_messages(turn_messages)
     
+
+    def _generate_session_title(self, session_id, turn_id, user_message):
+        if self._title_generator is None:
+            return
+        # 以数据库轮次为准，避免加载历史时过滤失败轮次造成重复命名。
+        try:
+            if not self._storage.needs_session_title(session_id, turn_id):
+                return
+            try:
+                title = normalize_title(self._title_generator(user_message))
+            except Exception:
+                logging.exception("生成会话标题失败，使用输入摘录，session_id=%s", session_id)
+                title = fallback_title(user_message)
+            changed = self._retry_storage_call(
+                lambda: self._storage.update_initial_session_title(
+                    session_id, turn_id, title,
+                )
+            )
+            if changed:
+                self._title_updates[session_id] = title
+                self._title_updates.move_to_end(session_id)
+                if len(self._title_updates) > 100:
+                    self._title_updates.popitem(last=False)
+        except Exception:
+            # 辅助功能失败不能中断回复或改变轮次状态。
+            logging.exception("保存会话标题失败，session_id=%s", session_id)
+
 
     def _prepare_model_inputs(
         self,
         session_id,
         user_message,
         turn_messages,
+        context_cache=None,
     ):
         def to_inputs(prepared):
             return {
@@ -294,11 +348,16 @@ class ChatService:
                 f"{hint} {error}"
             ) from error
 
-        prepared = self._context_manager.prepare_context(
-            session_id,
-            keep_recent_turns=self._keep_recent_turns,
-            context_fits=context_fits,
-        )
+        prepared = context_cache.get("prepared") if context_cache is not None else None
+        # 工具调用后的下一次请求复用本轮上下文；超预算时仍重新摘要。
+        if prepared is None or not context_fits(prepared):
+            prepared = self._context_manager.prepare_context(
+                session_id,
+                keep_recent_turns=self._keep_recent_turns,
+                context_fits=context_fits,
+            )
+            if context_cache is not None:
+                context_cache["prepared"] = prepared
 
         logging.info(
             "上下文准备完成，session_id=%s，summary_status=%s",
@@ -343,7 +402,7 @@ class ChatService:
         reason = response.response_metadata.get("finish_reason")
 
         if reason not in ("stop", "tool_calls"):
-            raise RuntimeError(f"模型响应为正常完成，finish_reason={reason!r}")
+            raise RuntimeError(f"模型响应未正常完成，finish_reason={reason!r}")
         
         if response.invalid_tool_calls:
             raise RuntimeError("模型返回了无法解析的工具调用")
@@ -357,3 +416,90 @@ class ChatService:
             
             if not isinstance(response.content, str) or not response.content.strip():
                 raise RuntimeError("模型正常结束，但没有返回有效的文本回答")
+            
+
+    def _retry_storage_call(self, operation):
+        retryable_errors = {
+            errorcode.ER_LOCK_WAIT_TIMEOUT,
+            errorcode.ER_LOCK_DEADLOCK,
+            errorcode.CR_SERVER_GONE_ERROR,
+            errorcode.CR_SERVER_LOST,
+            errorcode.CR_SERVER_LOST_EXTENDED,
+        }
+
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return operation()
+            except MySQLError as error:
+                if (
+                    error.errno not in retryable_errors
+                    or attempt == max_attempts
+                ):
+                    raise
+
+                delay = 0.2 * (2 ** (attempt - 1))
+
+                logging.warning(
+                    "数据库操作失败，errno=%s，"
+                    "%.1f 秒后进行第 %s/%s 次尝试",
+                    error.errno,
+                    delay,
+                    attempt + 1,
+                    max_attempts,
+                )
+                sleep(delay)
+
+
+    def _save_message_with_retry(self, turn_id, message_data):
+        # 同一次保存操作，只生成一次 ID，并固定要保存的数据。
+        message_id = str(uuid4())
+        data_snapshot = deepcopy(message_data)
+
+        return self._retry_storage_call(
+            lambda: self._storage.save_message(
+                turn_id,
+                data_snapshot,
+                message_id=message_id,
+            )
+        )
+
+
+    def _finish_turn_with_retry(
+        self,
+        turn_id,
+        status,
+        error_message=None,
+    ):
+        return self._retry_storage_call(
+            lambda: self._storage.finish_turn(
+                turn_id,
+                status=status,
+                error_message=error_message,
+            )
+        )
+    
+
+    def _start_turn_with_retry(self, session_id, execution_config=None):
+        # 一次创建操作，只生成一次 ID。
+        turn_id = str(uuid4())
+        config_snapshot = deepcopy(execution_config)
+
+        try:
+            return self._retry_storage_call(
+                lambda: self._storage.start_turn(
+                    session_id,
+                    execution_config=config_snapshot,
+                    turn_id=turn_id,
+                )
+            )
+        except Exception:
+            logging.exception(
+                "无法确认轮次创建结果，session_id=%s，turn_id=%s",
+                session_id,
+                turn_id,
+            )
+            raise
+
+
